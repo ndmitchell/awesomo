@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveDataTypeable, PatternGuards #-}
 
 module Main where
 
@@ -28,8 +28,8 @@ main = do
 
 
 writeDot file prg = do
-    writeFile (file ++ ".dot") $ toDot prg
-    system $ "\"C:\\Program Files\\Graphviz2.22\\bin\\dot.exe\" -Tpng " ++ file ++ ".dot -o" ++ file ++ ".png"
+    writeFile (file ++ ".gv") $ toDot prg
+    system $ "\"C:\\Program Files\\Graphviz2.22\\bin\\dot.exe\" -Tpng " ++ file ++ ".gv -o" ++ file ++ ".png"
 
 
 ---------------------------------------------------------------------
@@ -44,13 +44,27 @@ data Exp
     = Lam Ptr Ptr
     | App Ptr Ptr
     | Var Var
-    | Push Ptr [(Ptr, Ptr)]
+    | Push Ptr [(Ptr, Ptr)] -- Invariant: fst of the second component must all point at Var
     | Con Con [Ptr]
     | Case Ptr [(Con, [Ptr], Ptr)]
       deriving (Show,Data,Typeable)
 
 data Prog = Prog {progUnique :: Ptr, progBind :: [(Ptr,Exp)], progRoot :: Ptr}
             deriving (Show,Data,Typeable)
+
+
+(+=) :: (Ptr,Exp) -> [(Ptr,Exp)] -> [(Ptr,Exp)]
+lhs += rhs = [lhs] ++= rhs
+
+-- | Join the bindings so the ones on the left take preference
+(++=) :: [(Ptr,Exp)] -> [(Ptr,Exp)] -> [(Ptr,Exp)]
+lhs ++= rhs = lhs ++ filter (flip notElem (map fst lhs) . fst) rhs
+
+-- | Join two sets of Push nodes, apply the left one first, then the right one
+(+->) :: [(Ptr,Ptr)] -> [(Ptr,Ptr)] -> [(Ptr,Ptr)]
+lhs +-> rhs = [(ask lhs $ ask rhs x, x) | x <- nub $ map snd lhs ++ map snd rhs]
+    where ask s x = fromMaybe x $ rlookup x s
+
 
 ---------------------------------------------------------------------
 -- MONAD
@@ -119,13 +133,13 @@ toGraphExp env (C.Case x ps) = do
 -- TO DOT
 
 toDot :: Prog -> String
-toDot (Prog _ bind x) = unlines $ ["digraph g {","start -> " ++ show x ++ ";"] ++ map f bind ++ ["}"]
+toDot (Prog _ bind x) = unlines $ ["digraph g {","node[fontname=Sans];","start -> " ++ show x ++ ";"] ++ map f bind ++ ["}"]
     where
         f (p, Lam a b) = show p ++ "[label=\"%\"];" ++ show p ++ "->" ++ show a ++ "[style=dotted];" ++ show p ++ "->" ++ show b ++ ";"
         f (p, App a b) = show p ++ "[label=\"$\"];" ++ show p ++ "->" ++ show a ++ ";" ++ show p ++ "->" ++ show b ++ "[style=dotted];"
         f (p, Var a) = show p ++ "[shape=box label=" ++ show a ++ "];"
         f (p, Push a []) = show p ++ "[shape=box label=\"\"];" ++ show p ++ "->" ++ show a ++ ";"
-        f (p, Push a bs) = show p ++ "[shape=box label=\"\"];_" ++ show p ++ "[label=\"\"];" ++
+        f (p, Push a bs) = show p ++ "[shape=box label=\"\"];_" ++ show p ++ "[shape=point label=\"\"];" ++
                            show p ++ "->_" ++ show p ++ ";_" ++ show p ++ "->" ++ show a ++ ";" ++
                            concat [show x ++ "->_" ++ show p ++ "[style=dashed label=" ++ show i ++ "];_" ++ show p ++ "->" ++ show y ++ "[style=dashed label=" ++ show i ++ "]" | (i,(x,y)) <- zip [1..] bs]
         f (p, Con c cs) = show p ++ "[label=" ++ show c ++ "];" ++
@@ -166,10 +180,10 @@ step :: Prog -> Maybe Prog
 step (Prog u bind p) = case lookup_ p bind of
     Push a [] -> Just $ Prog u bind a
     Push a bs | (n:ew, Prog u bind p) <- dupe (a:map fst bs) $ Prog u bind p -> Just $ repoint (zip ew $ map snd bs) $ Prog u bind n
-    App a b | Lam c d <- lookup_ a bind -> Just $ Prog u ((p,Push d [(c,b)]) : remove p bind) p
-            | Just (Prog u2 bind2 p2) <- step $ Prog u bind a -> Just $ Prog u2 ((p,App p2 b) : remove p bind2) p
-    Case a b | Con c d <- lookup_ a bind, (_,ps,bod):_ <- filter ((==) c . fst3) b -> Nothing
-             | Just (Prog u2 bind2 p2) <- step $ Prog u bind a -> Just $ Prog u2 ((p,Case p2 b) : remove p bind2) p
+    App a b | Lam c d <- lookup_ a bind -> Just $ Prog u ((p,Push d [(c,b)]) += bind) p
+            | Just (Prog u2 bind2 p2) <- step $ Prog u bind a -> Just $ Prog u2 ((p,App p2 b) += bind2) p
+    Case a b | Con c d <- lookup_ a bind, (_,ps,bod):_ <- filter ((==) c . fst3) b, length ps == length d -> Just $ Prog u ((p,Push bod (zip ps d)) += bind) p
+             | Just (Prog u2 bind2 p2) <- step $ Prog u bind a -> Just $ Prog u2 ((p,Case p2 b) += bind2) p
     _ -> Nothing
 
 
@@ -198,7 +212,7 @@ repoint env (Prog a b c) = Prog a (map f b) c
 -- SIMPLIFY
 
 simplify :: Prog -> Prog
-simplify x = applyLambda $ emptyPush $ dullPush $ applyLambda $ applyLambda $ applyLambda $ applyLambda $ applyLambda $ emptyPush $ emptyPush x
+simplify x = applyCtor $ applyCtor $ applyLambda $ emptyPush $ dullPush $ applyLambda $ applyLambda $ applyLambda $ applyLambda $ applyLambda $ emptyPush $ emptyPush x
 
 dullPush :: Prog -> Prog
 dullPush (Prog a b c) = Prog a (map (second f) b) c
@@ -212,8 +226,14 @@ emptyPush (Prog a b c) = rename env $ Prog a b c
 
 
 applyLambda :: Prog -> Prog
-applyLambda (Prog u bind start) = Prog u (env ++ removes (map fst env) bind) start
-    where env = [(p,Push d [(c,b)]) | (p,App a b) <- bind, Lam c d <- [lookup_ a bind]]
+applyLambda (Prog u bind start) = Prog u ((env1 ++ env2) ++= bind) start
+    where env1 = [(p,Push d [(c,b)]) | (p,App a b) <- bind, Lam c d <- [lookup_ a bind]]
+          env2 = [(p,Push f (ds +-> [(e,b)])) | (p,App a b) <- bind, Push c ds <- [lookup_ a bind], Lam e f <- [lookup_ c bind]]
+
+
+applyCtor :: Prog -> Prog
+applyCtor (Prog u bind start) = Prog u (env ++= bind) start
+    where env = [(p,Con c (d++[b])) | (p,App a b) <- bind, Con c d <- [lookup_ a bind]]
 
 
 rename :: [(Ptr,Ptr)] -> Prog -> Prog
@@ -225,8 +245,6 @@ rename env (Prog a b c) = Prog a (map (second $ transformBi f) b) (f c)
 -- UTILITY
 
 lookup_ x y = fromJust $ lookup x y
-
-remove x ys = filter ((/=) x . fst) ys
-removes xs ys = filter (flip notElem xs . fst) ys
-
 fst3 (a,_,_) = a
+swap (x,y) = (y,x)
+rlookup x y = lookup x $ map swap y
